@@ -1,17 +1,26 @@
 // Copyright (c) 2017 Franka Emika GmbH
 // Use of this source code is governed by the Apache-2.0 license, see LICENSE
+
+/// libstdc++
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
 
+#include <sched.h>
+
+/// ROS
 #include <actionlib/server/simple_action_server.h>
 #include <controller_manager/controller_manager.h>
+
+/// Franka
 #include <franka/exception.h>
 #include <franka/robot.h>
 #include <franka_hw/franka_hw.h>
 #include <franka_hw/services.h>
 #include <franka_msgs/ErrorRecoveryAction.h>
+
+/// ROS again
 #include <ros/ros.h>
 #include <std_srvs/Trigger.h>
 
@@ -111,8 +120,24 @@ int main(int argc, char** argv) {
   ros::AsyncSpinner spinner(4);
   spinner.start();
 
+  struct sched_param schedp;
+  memset(&schedp, 0, sizeof(schedp));
+  schedp.sched_priority = 99;
+  if (!sched_setscheduler(0, SCHED_FIFO, &schedp))
+    ROS_INFO_THROTTLE(1, "Set franka_control_node to SCHED FIFO priority %d",
+                      schedp.sched_priority);
+  else
+    ROS_INFO_THROTTLE(1, "Failed to set franka_control_node to SCHED FIFO priority %d",
+                      schedp.sched_priority);
+
+  std::vector<long double> time_diff_array(2000);
+  long double elapsed_time=0.0;
+  long unsigned int nb_it=0;
+  long double min_time_diff=0.001,max_time_diff=0.001;
+  struct timespec prev_time_measurement;
   while (ros::ok()) {
     ros::Time last_time = ros::Time::now();
+
 
     // Wait until controller has been activated or error has been recovered
     while (!franka_control.controllerActive() || has_error) {
@@ -144,6 +169,37 @@ int main(int argc, char** argv) {
       try {
         // Run control loop. Will exit if the controller is switched.
         franka_control.control([&](const ros::Time& now, const ros::Duration& period) {
+          struct timespec a_time_measurement;
+          clock_gettime(CLOCK_MONOTONIC,&a_time_measurement);
+          if (nb_it!=0)
+            {
+              long double time_diff= a_time_measurement.tv_sec - prev_time_measurement.tv_sec +
+                1e-9 * (a_time_measurement.tv_nsec - prev_time_measurement.tv_nsec);
+              if (time_diff < min_time_diff)
+                min_time_diff = time_diff;
+              else if (time_diff > max_time_diff)
+                max_time_diff = time_diff;
+              elapsed_time = elapsed_time + time_diff;
+              time_diff_array[nb_it%2000] = time_diff;
+              if (nb_it%2000==0)
+                {
+
+                  ROS_INFO("franka_control: %Lf %Lf %Lf",
+                           min_time_diff,
+                           elapsed_time/((long double)2000.0),
+                           max_time_diff);
+
+                  min_time_diff = max_time_diff = 0.001;
+
+                }
+              if (nb_it>2000)
+                elapsed_time = elapsed_time - time_diff_array[(nb_it-1)%2000];
+            }
+          prev_time_measurement.tv_sec = a_time_measurement.tv_sec;
+          prev_time_measurement.tv_nsec = a_time_measurement.tv_nsec;
+
+          nb_it++;
+
           if (period.toSec() == 0.0) {
             // Reset controllers before starting a motion
             control_manager.update(now, period, true);
@@ -154,6 +210,7 @@ int main(int argc, char** argv) {
             franka_control.checkJointLimits();
             franka_control.enforceLimits(period);
           }
+
           return ros::ok();
         });
       } catch (const franka::ControlException& e) {
